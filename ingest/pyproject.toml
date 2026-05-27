@@ -1,0 +1,64 @@
+[project]
+name = "hrrr-ingest"
+version = "0.1.0"
+description = "HRRR Threshold Tool ingest worker: fetch, subset, compute, and publish HRRR cycles to R2 as Zarr."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Alex Cooke" }]
+
+# Dependency ranges are intentionally loose here; exact pins live in uv.lock
+# (run `uv lock`). The Docker build installs with `uv sync --frozen` so the
+# lockfile is the single source of truth for "all pinned" (spec 10.1).
+dependencies = [
+    # --- GRIB/array stack ---
+    "xarray>=2025.1.0",
+    "cfgrib>=0.9.14",
+    "eccodes>=2.38",        # Python bindings; system libeccodes installed in Docker
+    "dask>=2025.1.0",       # chunked compute; chunks={'isobaricInhPa': 10} per spec 3.3
+    "numpy>=2.1",
+    # --- Zarr output ---
+    "zarr>=3.0",            # Zarr 3 codecs (BloscCodec) per spec 3.5
+    "numcodecs>=0.15",      # Quantize layered before Blosc (deferred tuning, spec 3.5)
+    # --- Object storage (R2 is S3-compatible) ---
+    "s3fs>=2025.1.0",       # fsspec store for ds.to_zarr("s3://...")
+    "boto3>=1.35",          # atomic manifest writes / cycle deletes
+    # --- HTTP (NOAA S3 over HTTPS fetch + Pushover notify) ---
+    "httpx>=0.28",
+    # --- Config ---
+    "python-dotenv>=1.0",   # load .env; all operational knobs are env vars (spec 8.2)
+]
+
+[project.scripts]
+hrrr-ingest = "hrrr_ingest.orchestrator:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hrrr_ingest"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "integration: exercises real GRIB data via a network-gated fixture (skips when offline)",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

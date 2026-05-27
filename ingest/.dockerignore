@@ -1,0 +1,15 @@
+# Keep the build context small and free of secrets/artifacts.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+tests/
+*.zarr/
+*.grib2
+.bench/
+benchmark_work/
+.DS_Store
+README.md.bak

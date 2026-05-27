@@ -1,0 +1,17 @@
+.env
+.env.local
+__pycache__/
+*.pyc
+.DS_Store
+*.zarr/
+*.grib2
+
+# Python tooling / dev artifacts
+.venv/
+.ruff_cache/
+.pytest_cache/
+.bench/
+benchmark_work/
+
+# Ingest log output (docker-compose mounts ingest/logs)
+logs/

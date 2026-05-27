@@ -1,0 +1,30 @@
+# Ingest worker for the HRRR Threshold Tool.
+#
+# The orchestrator is a one-shot run (compute the current cycle, ingest, exit),
+# so the host cron triggers it per cycle rather than running it as a daemon:
+#
+#     docker compose run --rm ingest
+#
+# (deploy/cron.sh, added in a later step, wraps this on the init+65min schedule.)
+# `docker compose build` / `up` still build the image; only the trigger differs
+# from a long-lived service. All config comes from the gitignored .env (spec 8.2).
+
+services:
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hrrr-ingest:latest
+    env_file:
+      - .env
+    restart: "no"
+    volumes:
+      # Structured log file (spec 2.5) and GRIB scratch space persist on the host.
+      - ./logs:/var/log/hrrr-ingest
+      - ingest-work:/tmp/hrrr-ingest
+    # Override the entrypoint args here for reruns, e.g.:
+    #   docker compose run --rm ingest --cycle 2026052400
+    #   docker compose run --rm ingest --dry-run
+
+volumes:
+  ingest-work:
