@@ -16,6 +16,9 @@ at **https://research.alexcooke.co/hrrr/**.
   start-to-finish, in-order setup (GitHub → R2 → website → VPS).
 - **[docs/runbook.md](docs/runbook.md)** — day-to-day operations, recovery,
   host migration, and the R2 public-access + CORS setup.
+- **[docs/mac-studio-migration.md](docs/mac-studio-migration.md)** — move HRRR +
+  QLCS compute onto a Mac Studio and retire the paid VPS (drops the cloud bill
+  to ~$0).
 - **[docs/hrrr_threshold_tool_spec.md](docs/hrrr_threshold_tool_spec.md)** — the
   full project specification.
 
