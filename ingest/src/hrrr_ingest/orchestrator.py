@@ -158,19 +158,28 @@ def run_cycle(
             f"failed={[f'f{h:02d}' for h in sorted(failed)]}"
         )
 
-    # --- publish: manifest + atomic promote + drop previous (spec 2.2) ---
+    # --- publish: manifest + atomic promote + drop superseded cycles ---
+    # Manifest has two pointers (current + current_extended). We keep BOTH
+    # referenced cycles on R2 and delete anything else. After promotion, the
+    # keep set is {new current, new extended} — the extended pointer is sticky
+    # across standard runs, so the last 48 h forecast stays reachable until
+    # the next 00/06/12/18 Z run supersedes it.
     if dry_run:
-        logger.info("dry-run: would write cycle manifest, promote, drop previous", extra={
+        logger.info("dry-run: would write cycle manifest, promote, drop superseded", extra={
             "cycle": cycle.cycle_id, "cycle_prefix": publish.cycle_prefix(cfg, cycle),
         })
     else:
         parameters = next((r.parameters for r in results.values() if r.parameters), None)
         publish.write_cycle_manifest(cycle, forecast_hours, cfg, parameters=parameters)
-        previous = publish.read_current_cycle_id(cfg)
+        prev_current = publish.read_current_cycle_id(cfg)
+        prev_extended = publish.read_current_extended_cycle_id(cfg)
         publish.promote_cycle(cycle, cfg)
-        if previous and previous != cycle.cycle_id:
-            publish.delete_cycle(parse_cycle_id(previous), cfg)
-            logger.info("dropped previous cycle", extra={"previous": previous})
+        new_extended = cycle.cycle_id if cycle.is_extended else prev_extended
+        keep = {cycle.cycle_id} | ({new_extended} if new_extended else set())
+        for old in {prev_current, prev_extended}:
+            if old and old not in keep:
+                publish.delete_cycle(parse_cycle_id(old), cfg)
+                logger.info("dropped cycle", extra={"cycle": old})
 
     # Remove the (now-empty) scratch dir for this cycle.
     shutil.rmtree(Path(cfg.work_dir) / cycle.cycle_id, ignore_errors=True)

@@ -201,26 +201,58 @@ def write_cycle_manifest(
 
 
 def promote_cycle(cycle: Cycle, cfg: Config, store: Store | None = None) -> None:
-    """Atomically repoint the global manifest.json at ``cycle`` (spec 2.2)."""
+    """Atomically repoint the global manifest.json at ``cycle`` (spec 2.2).
+
+    The manifest carries two pointers: ``current_cycle`` is always set to the
+    cycle being promoted, and ``current_extended_cycle`` is set to this cycle
+    only when it's an extended run (00/06/12/18 Z). Otherwise the extended
+    pointer is preserved from the previous manifest so the most recent 48 h
+    forecast stays reachable between extended runs — the frontend offers a
+    user-facing toggle that swaps the active cycle between the two pointers.
+    """
     st = _store(cfg, store)
+    prev = _read_global_manifest(st) or {}
+    if cycle.is_extended:
+        extended_id = cycle.cycle_id
+        extended_key = cycle_manifest_key(cfg, cycle)
+    else:
+        extended_id = prev.get("current_extended_cycle")
+        extended_key = prev.get("current_extended_cycle_manifest_key")
     global_manifest = {
         "schema_version": SCHEMA_VERSION,
         "current_cycle": cycle.cycle_id,
         "cycle_manifest_key": cycle_manifest_key(cfg, cycle),
+        "current_extended_cycle": extended_id,
+        "current_extended_cycle_manifest_key": extended_key,
         "updated": datetime.now(UTC).isoformat(),
     }
     _write_json(st, MANIFEST_KEY, global_manifest)
-    logger.info("promoted cycle", extra={"cycle": cycle.cycle_id})
+    logger.info("promoted cycle", extra={
+        "cycle": cycle.cycle_id,
+        "extended": extended_id,
+    })
+
+
+def _read_global_manifest(st: Store) -> dict | None:
+    """Return the parsed global manifest.json, or None if it doesn't exist."""
+    path = st.path(MANIFEST_KEY)
+    if not st.fs.exists(path):
+        return None
+    return json.loads(st.fs.cat_file(path))
 
 
 def read_current_cycle_id(cfg: Config, store: Store | None = None) -> str | None:
     """Return the cycle id the global manifest currently points at, or None."""
     st = _store(cfg, store)
-    path = st.path(MANIFEST_KEY)
-    if not st.fs.exists(path):
-        return None
-    data = json.loads(st.fs.cat_file(path))
+    data = _read_global_manifest(st) or {}
     return data.get("current_cycle")
+
+
+def read_current_extended_cycle_id(cfg: Config, store: Store | None = None) -> str | None:
+    """Return the cycle id the extended pointer is on, or None."""
+    st = _store(cfg, store)
+    data = _read_global_manifest(st) or {}
+    return data.get("current_extended_cycle")
 
 
 def delete_cycle(cycle: Cycle, cfg: Config, store: Store | None = None) -> None:

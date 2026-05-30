@@ -86,3 +86,25 @@ def test_global_manifest_shape(cfg, store):
     assert data["current_cycle"] == "2026052412"
     assert data["cycle_manifest_key"] == "cycles/2026052412/manifest.json"
     assert data["schema_version"] == publish.SCHEMA_VERSION
+
+
+def test_extended_pointer_promotion(cfg, store):
+    """current_extended_cycle is set by 00/06/12/18Z runs and preserved by others."""
+    extended = parse_cycle_id("2026052400")  # 00Z → extended
+    standard = parse_cycle_id("2026052401")  # 01Z → standard
+
+    # First promote the extended run: both pointers go to it.
+    publish.promote_cycle(extended, cfg, store=store)
+    assert publish.read_current_cycle_id(cfg, store=store) == "2026052400"
+    assert publish.read_current_extended_cycle_id(cfg, store=store) == "2026052400"
+
+    # Then promote a standard run: current advances but extended stays put.
+    publish.promote_cycle(standard, cfg, store=store)
+    assert publish.read_current_cycle_id(cfg, store=store) == "2026052401"
+    assert publish.read_current_extended_cycle_id(cfg, store=store) == "2026052400"
+
+    # The next extended run (06Z) updates both pointers.
+    next_extended = parse_cycle_id("2026052406")
+    publish.promote_cycle(next_extended, cfg, store=store)
+    assert publish.read_current_cycle_id(cfg, store=store) == "2026052406"
+    assert publish.read_current_extended_cycle_id(cfg, store=store) == "2026052406"
