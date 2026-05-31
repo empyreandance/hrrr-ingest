@@ -96,6 +96,14 @@ class Config:
     log_level: str
     # Scratch directory for downloaded/subset GRIB before it is opened.
     work_dir: str = field(default="/tmp/hrrr-ingest")
+    # Streaming fetch: when a forecast hour's GRIB is not on NOAA yet (HTTP 404),
+    # poll every ``fetch_poll_seconds`` until it publishes or ``fetch_max_wait_seconds``
+    # elapses, instead of failing the cycle. This lets a worker pick up each hour
+    # as NOAA publishes it (f00 lands ~init+55min; the tail hour later), so the
+    # cycle promotes shortly after its last hour appears instead of being fetched
+    # at a fixed time and failing on not-yet-published hours.
+    fetch_poll_seconds: int = 60
+    fetch_max_wait_seconds: int = 3600
 
     @classmethod
     def from_env(cls, *, load_dotenv_file: bool = True, require_r2: bool = True) -> Config:
@@ -130,4 +138,6 @@ class Config:
             log_file=_optional("LOG_FILE", "/var/log/hrrr-ingest/ingest.log"),
             log_level=_optional("LOG_LEVEL", "INFO"),
             work_dir=_optional("WORK_DIR", "/tmp/hrrr-ingest"),
+            fetch_poll_seconds=_int("FETCH_POLL_SECONDS", 60),
+            fetch_max_wait_seconds=_int("FETCH_MAX_WAIT_SECONDS", 3600),
         )

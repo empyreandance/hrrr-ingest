@@ -36,39 +36,65 @@ def grib_url(cfg: Config, cycle: Cycle, forecast_hour: int) -> str:
 def fetch_grib(cycle: Cycle, forecast_hour: int, cfg: Config) -> Path:
     """Download one forecast hour's raw GRIB2 to ``cfg.work_dir`` and return its path.
 
-    Streams to disk (keeps memory flat), retries transient failures with
-    exponential backoff, and validates the downloaded size against the server's
-    Content-Length.
+    Streaming-ingest behavior: an HTTP 404 means NOAA has not published this
+    forecast hour yet, so we *poll* (every ``cfg.fetch_poll_seconds``, up to
+    ``cfg.fetch_max_wait_seconds``) until it appears instead of failing. This
+    lets a worker pick up each hour the moment NOAA publishes it, so a cycle
+    drains and promotes shortly after its last hour lands — rather than being
+    fetched at a fixed time and failing on the not-yet-published tail. Genuine
+    transient failures (network errors, 5xx, truncated downloads) still use a
+    bounded exponential-backoff retry. Validates size against Content-Length.
     """
     url = grib_url(cfg, cycle, forecast_hour)
     dest_dir = Path(cfg.work_dir) / cycle.cycle_id
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / f"raw.wrfprsf{forecast_hour:02d}.grib2"
 
+    deadline = time.monotonic() + cfg.fetch_max_wait_seconds
+    transient_left = DEFAULT_RETRIES
     last_exc: Exception | None = None
-    for attempt in range(1, DEFAULT_RETRIES + 1):
+    while True:
         try:
             written = _stream_to_file(url, dest)
             _validate_size(dest, written)
             logger.info("fetched grib", extra={
-                "cycle": cycle.cycle_id, "fh": forecast_hour,
-                "bytes": written, "attempt": attempt,
+                "cycle": cycle.cycle_id, "fh": forecast_hour, "bytes": written,
             })
             return dest
         except (httpx.HTTPError, OSError) as exc:
             last_exc = exc
-            backoff = min(2 ** attempt, 30)
+            # httpx.HTTPStatusError subclasses HTTPError; a 404 is "not published
+            # yet" -> poll until it appears or the deadline. Everything else is a
+            # transient failure -> bounded exponential backoff.
+            not_published = (
+                isinstance(exc, httpx.HTTPStatusError)
+                and exc.response.status_code == 404
+            )
+            if not_published:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                logger.info("awaiting publication", extra={
+                    "cycle": cycle.cycle_id, "fh": forecast_hour,
+                    "poll_in_s": cfg.fetch_poll_seconds,
+                    "wait_remaining_s": round(remaining),
+                })
+                time.sleep(min(cfg.fetch_poll_seconds, remaining))
+                continue
+            transient_left -= 1
+            if transient_left <= 0:
+                break
+            backoff = min(2 ** (DEFAULT_RETRIES - transient_left), 30)
             logger.warning("fetch attempt failed", extra={
                 "cycle": cycle.cycle_id, "fh": forecast_hour,
-                "attempt": attempt, "error": str(exc), "retry_in_s": backoff,
+                "attempts_left": transient_left, "error": str(exc),
+                "retry_in_s": backoff,
             })
-            if attempt < DEFAULT_RETRIES:
-                time.sleep(backoff)
+            time.sleep(backoff)
 
     dest.unlink(missing_ok=True)
     raise RuntimeError(
-        f"failed to fetch f{forecast_hour:02d} for {cycle.cycle_id} after "
-        f"{DEFAULT_RETRIES} attempts: {last_exc}"
+        f"failed to fetch f{forecast_hour:02d} for {cycle.cycle_id}: {last_exc}"
     ) from last_exc
 
 
