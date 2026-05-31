@@ -51,6 +51,18 @@ def test_zarr_roundtrip_with_blosc(cfg, store, sample_ds, tmp_path):
     assert any(type(c).__name__ == "BloscCodec" for c in compressors)
 
 
+def test_list_cycle_ids(cfg, store):
+    """list_cycle_ids returns every cycle dir present (for GC), ignoring junk."""
+    assert publish.list_cycle_ids(cfg, store=store) == []  # empty store
+    for cid in ("2026052723", "2026052800", "2026052806"):
+        publish.write_cycle_manifest(parse_cycle_id(cid), [0], cfg, store=store)
+    # a non-cycle entry under cycles/ must be ignored
+    store.fs.makedirs(store.path("cycles/notacycle"), exist_ok=True)
+    assert sorted(publish.list_cycle_ids(cfg, store=store)) == [
+        "2026052723", "2026052800", "2026052806",
+    ]
+
+
 def test_manifest_lifecycle(cfg, store, sample_ds):
     prev, new = parse_cycle_id("2026052323"), parse_cycle_id("2026052400")
 

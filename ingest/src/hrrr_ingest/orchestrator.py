@@ -126,65 +126,74 @@ def run_cycle(
         "dry_run": dry_run,
     })
 
-    # --- fan out forecast hours across the worker pool (spec 2.1) ---
-    # max_tasks_per_child=1 recycles each worker after a forecast hour so peak
-    # RSS is reclaimed between hours (spec 3.3).
-    results: dict[int, ForecastHourResult] = {}
-    with ProcessPoolExecutor(
-        max_workers=cfg.workers,
-        max_tasks_per_child=1,
-        initializer=_init_worker,
-        initargs=(cfg.log_level, cfg.log_file),
-    ) as pool:
-        futures = {
-            pool.submit(process_forecast_hour, cycle, fh, cfg, dry_run): fh
-            for fh in forecast_hours
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            results[result.forecast_hour] = result
-            logger.info("forecast hour done", extra={
-                "cycle": cycle.cycle_id, "fh": result.forecast_hour,
-                "status": result.status, "error": result.error,
+    # Wrap the whole cycle so this run's scratch dir is always removed (success
+    # OR failure) — raw/subset GRIB must never accumulate in WORK_DIR.
+    try:
+        # --- fan out forecast hours across the worker pool (spec 2.1) ---
+        # max_tasks_per_child=1 recycles each worker after a forecast hour so
+        # peak RSS is reclaimed between hours (spec 3.3).
+        results: dict[int, ForecastHourResult] = {}
+        with ProcessPoolExecutor(
+            max_workers=cfg.workers,
+            max_tasks_per_child=1,
+            initializer=_init_worker,
+            initargs=(cfg.log_level, cfg.log_file),
+        ) as pool:
+            futures = {
+                pool.submit(process_forecast_hour, cycle, fh, cfg, dry_run): fh
+                for fh in forecast_hours
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                results[result.forecast_hour] = result
+                logger.info("forecast hour done", extra={
+                    "cycle": cycle.cycle_id, "fh": result.forecast_hour,
+                    "status": result.status, "error": result.error,
+                })
+
+        # --- validate completeness (spec 3.2 step 3) ---
+        missing = [fh for fh in forecast_hours if fh not in results]
+        failed = [fh for fh, r in results.items() if not r.ok]
+        if missing or failed:
+            raise IngestError(
+                f"cycle {cycle.cycle_id} incomplete: "
+                f"missing={[f'f{h:02d}' for h in sorted(missing)]} "
+                f"failed={[f'f{h:02d}' for h in sorted(failed)]}"
+            )
+
+        # --- publish: manifest + atomic promote + GC old cycles ---
+        # Manifest has two pointers (current + current_extended); we keep BOTH
+        # referenced cycles on R2 and delete everything else. The extended
+        # pointer is sticky across standard runs, so the last 48 h forecast
+        # stays reachable until the next 00/06/12/18 Z run supersedes it.
+        if dry_run:
+            logger.info("dry-run: would write cycle manifest, promote, GC old cycles", extra={
+                "cycle": cycle.cycle_id, "cycle_prefix": publish.cycle_prefix(cfg, cycle),
             })
+        else:
+            parameters = next((r.parameters for r in results.values() if r.parameters), None)
+            publish.write_cycle_manifest(cycle, forecast_hours, cfg, parameters=parameters)
+            prev_extended = publish.read_current_extended_cycle_id(cfg)
+            publish.promote_cycle(cycle, cfg)
+            new_extended = cycle.cycle_id if cycle.is_extended else prev_extended
+            keep = {cycle.cycle_id} | ({new_extended} if new_extended else set())
+            # Garbage-collect: keep ONLY {current, extended}, delete every other
+            # cycle on the store. The previous logic dropped just the immediately
+            # superseded current+extended, so orphans (failed/early runs, a prior
+            # host) accumulated unbounded. Best-effort: a GC error must not fail
+            # an already-promoted cycle.
+            try:
+                for old in publish.list_cycle_ids(cfg):
+                    if old not in keep:
+                        publish.delete_cycle(parse_cycle_id(old), cfg)
+                        logger.info("dropped cycle", extra={"cycle": old})
+            except Exception as exc:  # noqa: BLE001 - GC is best-effort
+                logger.warning("cycle GC failed", extra={"error": str(exc)})
 
-    # --- validate completeness (spec 3.2 step 3) ---
-    missing = [fh for fh in forecast_hours if fh not in results]
-    failed = [fh for fh, r in results.items() if not r.ok]
-    if missing or failed:
-        raise IngestError(
-            f"cycle {cycle.cycle_id} incomplete: "
-            f"missing={[f'f{h:02d}' for h in sorted(missing)]} "
-            f"failed={[f'f{h:02d}' for h in sorted(failed)]}"
-        )
-
-    # --- publish: manifest + atomic promote + drop superseded cycles ---
-    # Manifest has two pointers (current + current_extended). We keep BOTH
-    # referenced cycles on R2 and delete anything else. After promotion, the
-    # keep set is {new current, new extended} — the extended pointer is sticky
-    # across standard runs, so the last 48 h forecast stays reachable until
-    # the next 00/06/12/18 Z run supersedes it.
-    if dry_run:
-        logger.info("dry-run: would write cycle manifest, promote, drop superseded", extra={
-            "cycle": cycle.cycle_id, "cycle_prefix": publish.cycle_prefix(cfg, cycle),
-        })
-    else:
-        parameters = next((r.parameters for r in results.values() if r.parameters), None)
-        publish.write_cycle_manifest(cycle, forecast_hours, cfg, parameters=parameters)
-        prev_current = publish.read_current_cycle_id(cfg)
-        prev_extended = publish.read_current_extended_cycle_id(cfg)
-        publish.promote_cycle(cycle, cfg)
-        new_extended = cycle.cycle_id if cycle.is_extended else prev_extended
-        keep = {cycle.cycle_id} | ({new_extended} if new_extended else set())
-        for old in {prev_current, prev_extended}:
-            if old and old not in keep:
-                publish.delete_cycle(parse_cycle_id(old), cfg)
-                logger.info("dropped cycle", extra={"cycle": old})
-
-    # Remove the (now-empty) scratch dir for this cycle.
-    shutil.rmtree(Path(cfg.work_dir) / cycle.cycle_id, ignore_errors=True)
-    logger.info("cycle complete", extra={"cycle": cycle.cycle_id})
-    return 0
+        logger.info("cycle complete", extra={"cycle": cycle.cycle_id})
+        return 0
+    finally:
+        shutil.rmtree(Path(cfg.work_dir) / cycle.cycle_id, ignore_errors=True)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

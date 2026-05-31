@@ -264,6 +264,24 @@ def delete_cycle(cycle: Cycle, cfg: Config, store: Store | None = None) -> None:
         logger.info("deleted cycle", extra={"cycle": cycle.cycle_id})
 
 
+def list_cycle_ids(cfg: Config, store: Store | None = None) -> list[str]:
+    """Return every cycle id (``YYYYMMDDHH``) present under ``cycles/``.
+
+    Used to garbage-collect cycles that are neither current nor extended, so
+    orphans from failed/early runs or a prior host can't accumulate unbounded.
+    """
+    st = _store(cfg, store)
+    base = st.path("cycles").rstrip("/")
+    if not st.fs.exists(base):
+        return []
+    ids = []
+    for entry in st.fs.ls(base, detail=False):
+        name = str(entry).rstrip("/").rsplit("/", 1)[-1]
+        if len(name) == 10 and name.isdigit():
+            ids.append(name)
+    return ids
+
+
 def _write_json(store: Store, key: str, payload: dict) -> None:
     data = json.dumps(payload, indent=2).encode()
     path = store.path(key)
