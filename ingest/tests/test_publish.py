@@ -15,7 +15,10 @@ from hrrr_ingest.publish import Store
 
 
 @pytest.fixture
-def cfg():
+def cfg(tmp_path, monkeypatch):
+    # Point per-forecast-hour scratch at the test's tmp dir (schema 2.0 writes
+    # each FH locally, then assembles + uploads one store).
+    monkeypatch.setenv("WORK_DIR", str(tmp_path / "work"))
     return Config.from_env(load_dotenv_file=False, require_r2=False)
 
 
@@ -39,16 +42,24 @@ def sample_ds():
     return ds
 
 
-def test_zarr_roundtrip_with_blosc(cfg, store, sample_ds, tmp_path):
+def test_cycle_store_roundtrip_sharded(cfg, store, sample_ds, tmp_path):
+    """schema 2.0: per-FH local writes -> one sharded store with a forecast_hour
+    dim, Blosc-compressed, that round-trips."""
     cycle = parse_cycle_id("2026052400")
-    publish.write_forecast_hour(sample_ds, cycle, 6, cfg, store=store)
-    back = xr.open_zarr(f"{tmp_path}/cycles/2026052400/f06", consolidated=True)
-    assert np.allclose(back["sbcape"].values, sample_ds["sbcape"].values)
+    publish.write_forecast_hour_local(sample_ds, cycle, 0, cfg)
+    publish.write_forecast_hour_local(sample_ds, cycle, 1, cfg)
+    publish.assemble_and_upload_cycle(cycle, [0, 1], cfg, store=store)
+
+    back = xr.open_zarr(f"{tmp_path}/cycles/2026052400/data.zarr", consolidated=True)
+    assert back.sizes["forecast_hour"] == 2
+    assert back["forecast_hour"].values.tolist() == [0, 1]
+    assert np.allclose(back["sbcape"].isel(forecast_hour=0).values, sample_ds["sbcape"].values)
 
     import zarr
-    group = zarr.open_group(f"{tmp_path}/cycles/2026052400/f06")
-    compressors = group["sbcape"].compressors
-    assert any(type(c).__name__ == "BloscCodec" for c in compressors)
+    arr = zarr.open_group(f"{tmp_path}/cycles/2026052400/data.zarr")["sbcape"]
+    assert arr.shards is not None  # sharded (one object for the whole 2D field)
+    meta = str(arr.metadata).lower()
+    assert "sharding" in meta and "blosc" in meta
 
 
 def test_list_cycle_ids(cfg, store):
@@ -74,7 +85,8 @@ def test_manifest_lifecycle(cfg, store, sample_ds):
     assert publish.read_current_cycle_id(cfg, store=store) == "2026052323"
 
     # write + promote the new cycle, then drop the previous
-    publish.write_forecast_hour(sample_ds, new, 0, cfg, store=store)
+    publish.write_forecast_hour_local(sample_ds, new, 0, cfg)
+    publish.assemble_and_upload_cycle(new, [0], cfg, store=store)
     params = publish.parameter_metadata(sample_ds)
     manifest = publish.write_cycle_manifest(new, [0], cfg, parameters=params, store=store)
     assert manifest["cycle_id"] == "2026052400"

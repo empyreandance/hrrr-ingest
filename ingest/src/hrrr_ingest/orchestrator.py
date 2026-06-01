@@ -90,7 +90,7 @@ def process_forecast_hour(
         ds = compute.build_forecast_hour_dataset(
             subset_path, cfg, cycle_id=cycle.cycle_id, forecast_hour=forecast_hour
         )
-        publish.write_forecast_hour(ds, cycle, forecast_hour, cfg)
+        publish.write_forecast_hour_local(ds, cycle, forecast_hour, cfg)
         parameters = publish.parameter_metadata(ds)
 
         # Reclaim memory before this worker is recycled (spec 3.3).
@@ -172,6 +172,9 @@ def run_cycle(
             })
         else:
             parameters = next((r.parameters for r in results.values() if r.parameters), None)
+            # Assemble the per-FH local scratch into one sharded store and upload
+            # it once (schema 2.0) BEFORE the manifest points readers at it.
+            publish.assemble_and_upload_cycle(cycle, forecast_hours, cfg)
             publish.write_cycle_manifest(cycle, forecast_hours, cfg, parameters=parameters)
             prev_extended = publish.read_current_extended_cycle_id(cfg)
             publish.promote_cycle(cycle, cfg)

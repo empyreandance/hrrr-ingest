@@ -20,16 +20,18 @@ from hrrr_ingest.publish import Store
 
 
 @pytest.mark.integration
-def test_end_to_end_one_forecast_hour(mini_grib, tmp_path):
+def test_end_to_end_one_forecast_hour(mini_grib, tmp_path, monkeypatch):
     from hrrr_ingest import compute
 
+    monkeypatch.setenv("WORK_DIR", str(tmp_path / "work"))
     cfg = Config.from_env(load_dotenv_file=False, require_r2=False)
     store = Store(base_url=str(tmp_path), storage_options={})
     cycle = parse_cycle_id("2024010100")
 
-    # compute -> write zarr -> cycle manifest -> promote global manifest
+    # compute -> write FH to local scratch -> assemble one sharded store -> manifests
     ds = compute.build_forecast_hour_dataset(mini_grib, cfg, cycle_id="2024010100", forecast_hour=0)
-    publish.write_forecast_hour(ds, cycle, 0, cfg, store=store)
+    publish.write_forecast_hour_local(ds, cycle, 0, cfg)
+    publish.assemble_and_upload_cycle(cycle, [0], cfg, store=store)
     params = publish.parameter_metadata(ds)
     publish.write_cycle_manifest(cycle, [0], cfg, parameters=params, store=store)
     publish.promote_cycle(cycle, cfg, store=store)
@@ -45,7 +47,8 @@ def test_end_to_end_one_forecast_hour(mini_grib, tmp_path):
     assert by_id["wind_speed_10m"]["source"] == "derived"  # computed (spec 4.2)
     assert {"hrrr", "derived"} <= {p["source"] for p in cyc_manifest["parameters"]}
 
-    # 3) the zarr is readable and round-trips a value
-    back = xr.open_zarr(f"{tmp_path}/cycles/2024010100/f00", consolidated=True)
+    # 3) the single sharded store is readable and round-trips a value
+    back = xr.open_zarr(f"{tmp_path}/cycles/2024010100/data.zarr", consolidated=True)
+    assert back.sizes["forecast_hour"] == 1
     assert "t2m" in back and back["t2m"].attrs["source"] == "hrrr"
     assert "isobaricInhPa" in back["t_pressure"].dims

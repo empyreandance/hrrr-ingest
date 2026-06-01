@@ -21,6 +21,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fsspec
@@ -34,7 +35,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("hrrr_ingest.publish")
 
 MANIFEST_KEY = "manifest.json"
-SCHEMA_VERSION = "1.0"
+# 2.0: one sharded Zarr store per cycle with a forecast_hour dimension
+# (cycles/<id>/data.zarr), instead of a separate group per forecast hour. This
+# collapses the per-cycle object count ~100x (each cycle was ~150k tiny chunk
+# objects re-uploaded ~24x/day = ~1M R2 Class-A PUTs/day) by writing the whole
+# cycle locally, then uploading one sharded store. See assemble_and_upload_cycle.
+SCHEMA_VERSION = "2.0"
 
 
 @dataclass(frozen=True)
@@ -91,50 +97,134 @@ def forecast_hour_key(cfg: Config, cycle: Cycle, forecast_hour: int) -> str:
     return f"{cycle_prefix(cfg, cycle)}f{forecast_hour:02d}"
 
 
+def cycle_store_key(cfg: Config, cycle: Cycle) -> str:
+    """Key of the single per-cycle Zarr store (schema 2.0)."""
+    return f"{cycle_prefix(cfg, cycle)}data.zarr"
+
+
 def cycle_manifest_key(cfg: Config, cycle: Cycle) -> str:
     return f"{cycle_prefix(cfg, cycle)}{MANIFEST_KEY}"
 
 
 # --- Zarr write ------------------------------------------------------------
 
-def _zarr_encoding(ds: xr.Dataset) -> dict:
-    """Zarr 3 Blosc-Zstd compressor for every data variable (spec 3.5)."""
-    from zarr.codecs import BloscCodec, BloscShuffle
-
-    compressor = BloscCodec(cname="zstd", clevel=5, shuffle=BloscShuffle.shuffle)
-    return {var: {"compressors": (compressor,)} for var in ds.data_vars}
+def forecast_hour_scratch(cfg: Config, cycle: Cycle, forecast_hour: int) -> Path:
+    """Local scratch path for one forecast hour's intermediate Zarr group. Lives
+    under WORK_DIR/<cycle_id>/ so the orchestrator's per-cycle rmtree cleans it."""
+    return Path(cfg.work_dir) / cycle.cycle_id / "fh" / f"f{forecast_hour:02d}.zarr"
 
 
-def write_forecast_hour(
-    ds: xr.Dataset,
-    cycle: Cycle,
-    forecast_hour: int,
-    cfg: Config,
-    store: Store | None = None,
-) -> None:
-    """Write one forecast hour's dataset to its Zarr group (spec 3.2 step 6)."""
-    st = _store(cfg, store)
-    url = st.url(forecast_hour_key(cfg, cycle, forecast_hour))
-    # consolidated=True is additive (per-array metadata is still written, so a
-    # reader that doesn't understand v3 consolidated metadata works regardless);
-    # it just saves the frontend a metadata request per array. zarr-python warns
-    # that v3 consolidated metadata isn't yet in the spec — expected, so silence
-    # it here rather than emit it on every forecast-hour write.
-    # TODO(phase2): confirm the chosen JS Zarr reader handles this store layout.
+def write_forecast_hour_local(
+    ds: xr.Dataset, cycle: Cycle, forecast_hour: int, cfg: Config
+) -> str:
+    """Write one forecast hour to LOCAL scratch (free) — NOT R2. The parent later
+    concatenates every hour into one sharded store and uploads it once
+    (assemble_and_upload_cycle), so per-forecast-hour writes never hit R2."""
+    path = forecast_hour_scratch(cfg, cycle, forecast_hour)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-        ds.to_zarr(
-            url,
-            mode="w",
-            encoding=_zarr_encoding(ds),
-            storage_options=st.storage_options or None,
-            consolidated=True,
-            zarr_format=3,
-        )
-    logger.info("wrote forecast hour zarr", extra={
-        "cycle": cycle.cycle_id, "fh": forecast_hour, "url": url,
-        "n_vars": len(ds.data_vars),
+        ds.to_zarr(str(path), mode="w", consolidated=False, zarr_format=3)
+    logger.info("wrote forecast hour (local scratch)", extra={
+        "cycle": cycle.cycle_id, "fh": forecast_hour, "n_vars": len(ds.data_vars),
     })
+    return str(path)
+
+
+def _sharded_encoding(ds: xr.Dataset, n_fh: int, isobaric_chunk: int) -> dict:
+    """Per-variable Zarr 3 encoding for the combined cycle store.
+
+    Each variable is dimensioned (forecast_hour, [isobaricInhPa,] y, x). We shard
+    so the object count stays tiny while keeping read granularity:
+      - inner chunk: one forecast hour (x one isobaric block) -> the browser
+        range-reads exactly the slice it needs out of the shard.
+      - shard: spans ALL forecast hours (x one isobaric block) -> a 2D field is a
+        single object; a 3D field is one object per isobaric block (not per hour).
+    Blosc-zstd compressor as before (spec 3.5).
+    """
+    from zarr.codecs import BloscCodec, BloscShuffle
+
+    comp = BloscCodec(cname="zstd", clevel=5, shuffle=BloscShuffle.shuffle)
+    enc = {}
+    for v in ds.data_vars:
+        chunks, shards = [], []
+        for d in ds[v].dims:
+            n = int(ds.sizes[d])
+            if d == "forecast_hour":
+                chunks.append(1)
+                shards.append(n_fh)
+            elif d == "isobaricInhPa":
+                c = min(isobaric_chunk, n)
+                chunks.append(c)
+                shards.append(c)
+            else:  # spatial (y/x) — keep whole
+                chunks.append(n)
+                shards.append(n)
+        enc[v] = {"chunks": tuple(chunks), "shards": tuple(shards), "compressors": (comp,)}
+    return enc
+
+
+def assemble_and_upload_cycle(
+    cycle: Cycle, forecast_hours: list[int], cfg: Config, store: Store | None = None
+) -> str:
+    """Concatenate the local per-forecast-hour scratch stores into ONE sharded
+    Zarr store (forecast_hour dimension) and upload it to R2 in a single pass.
+
+    Variables absent from some hours (e.g. accumulated fields at f00) are filled
+    with NaN so every variable spans the whole forecast_hour axis.
+    """
+    import numpy as np
+    import pandas as pd
+    import xarray as xr
+
+    st = _store(cfg, store)
+    fhs = sorted(forecast_hours)
+    dss = [xr.open_zarr(str(forecast_hour_scratch(cfg, cycle, fh)), consolidated=False)
+           for fh in fhs]
+    try:
+        # Union the variable set; NaN-fill any hour missing a variable so concat
+        # along forecast_hour is well-formed.
+        all_vars = sorted(set().union(*(set(d.data_vars) for d in dss)))
+        template = {v: next(d[v] for d in dss if v in d.data_vars) for v in all_vars}
+        filled = []
+        for d in dss:
+            add = {v: xr.full_like(template[v], np.nan, dtype="float32")
+                   for v in all_vars if v not in d.data_vars}
+            filled.append((d.assign(add) if add else d)[all_vars])
+
+        combined = xr.concat(
+            filled, dim=pd.Index(fhs, name="forecast_hour"),
+            coords="minimal", compat="override",
+        )
+        n_fh = len(fhs)
+        # Rechunk so each Dask chunk == one shard: whole forecast_hour + whole
+        # spatial grid, one isobaric block. Otherwise Dask's per-hour / spatially
+        # split chunks would each write part of a shard in parallel, which xarray
+        # rejects as corruption-prone.
+        chunk_spec = {d: (cfg.isobaric_chunk if d == "isobaricInhPa" else -1)
+                      for d in combined.dims}
+        combined = combined.chunk(chunk_spec)
+        local = Path(cfg.work_dir) / cycle.cycle_id / "combined.zarr"
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+            combined.to_zarr(
+                str(local), mode="w", zarr_format=3, consolidated=True,
+                encoding=_sharded_encoding(combined, n_fh, cfg.isobaric_chunk),
+            )
+    finally:
+        for d in dss:
+            d.close()
+
+    # Upload the finished store to R2 in one shot (one PUT per store object).
+    dest = st.path(cycle_store_key(cfg, cycle)).rstrip("/")
+    if st.fs.exists(dest):
+        st.fs.rm(dest, recursive=True)
+    st.fs.put(str(local) + "/", dest + "/", recursive=True)
+    logger.info("assembled + uploaded cycle store", extra={
+        "cycle": cycle.cycle_id, "n_fh": n_fh, "n_vars": len(all_vars),
+        "url": st.url(cycle_store_key(cfg, cycle)),
+    })
+    return cycle_store_key(cfg, cycle)
 
 
 # --- manifest lifecycle ----------------------------------------------------
@@ -187,6 +277,7 @@ def write_cycle_manifest(
         "cycle_id": cycle.cycle_id,
         "init_time": cycle.init.isoformat(),
         "is_extended": cycle.is_extended,
+        "store_key": cycle_store_key(cfg, cycle),  # 2.0: single sharded store, FH dim
         "forecast_hours": sorted(forecast_hours),
         "n_forecast_hours": len(forecast_hours),
         "variables": sorted(p["id"] for p in parameters),
