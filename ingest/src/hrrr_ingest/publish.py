@@ -137,7 +137,9 @@ def write_forecast_hour_local(
     return str(path)
 
 
-def _sharded_encoding(ds: xr.Dataset, n_fh: int, isobaric_chunk: int) -> dict:
+def _sharded_encoding(
+    ds: xr.Dataset, n_fh: int, isobaric_chunk: int, stats: dict
+) -> dict:
     """Per-variable Zarr 3 encoding for the combined cycle store.
 
     Each variable is dimensioned (forecast_hour, [isobaricInhPa,] y, x). We shard
@@ -146,8 +148,15 @@ def _sharded_encoding(ds: xr.Dataset, n_fh: int, isobaric_chunk: int) -> dict:
         range-reads exactly the slice it needs out of the shard.
       - shard: spans ALL forecast hours (x one isobaric block) -> a 2D field is a
         single object; a 3D field is one object per isobaric block (not per hour).
-    Blosc-zstd compressor as before (spec 3.5).
+
+    Data variables are packed to **scaled int16** (CF `scale_factor`/`add_offset`,
+    `_FillValue=-32768` for NaN) using each field's own min/max (``stats``). That
+    ~halves bytes (upload + storage) at a per-field precision of (max-min)/65534 —
+    finer than display and on par with HRRR's native GRIB integer packing, so
+    it's not throwing away real signal. Blosc-zstd compressor on top (spec 3.5).
+    The frontend reader undoes the packing (hrrr/src/data.js).
     """
+    import numpy as np
     from zarr.codecs import BloscCodec, BloscShuffle
 
     comp = BloscCodec(cname="zstd", clevel=5, shuffle=BloscShuffle.shuffle)
@@ -166,7 +175,15 @@ def _sharded_encoding(ds: xr.Dataset, n_fh: int, isobaric_chunk: int) -> dict:
             else:  # spatial (y/x) — keep whole
                 chunks.append(n)
                 shards.append(n)
-        enc[v] = {"chunks": tuple(chunks), "shards": tuple(shards), "compressors": (comp,)}
+        e = {"chunks": tuple(chunks), "shards": tuple(shards), "compressors": (comp,)}
+        lo, hi = stats.get(v, (float("nan"), float("nan")))
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            # center the range so values map to int16 [-32767, 32767]; -32768 = NaN
+            e.update(dtype="int16", _FillValue=-32768,
+                     scale_factor=float((hi - lo) / 65534.0),
+                     add_offset=float((hi + lo) / 2.0))
+        # else (constant / all-NaN field): leave float32 — tiny, not worth packing
+        enc[v] = e
     return enc
 
 
@@ -210,12 +227,17 @@ def assemble_and_upload_cycle(
         chunk_spec = {d: (cfg.isobaric_chunk if d == "isobaricInhPa" else -1)
                       for d in combined.dims}
         combined = combined.chunk(chunk_spec)
+        # Per-variable global min/max (one fused Dask pass) -> scaled-int16 packing.
+        import dask
+        lo_ds, hi_ds = dask.compute(combined.min(skipna=True), combined.max(skipna=True))
+        stats = {v: (float(lo_ds[v].values), float(hi_ds[v].values))
+                 for v in combined.data_vars}
         local = Path(cfg.work_dir) / cycle.cycle_id / "combined.zarr"
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
             combined.to_zarr(
                 str(local), mode="w", zarr_format=3, consolidated=True,
-                encoding=_sharded_encoding(combined, n_fh, cfg.isobaric_chunk),
+                encoding=_sharded_encoding(combined, n_fh, cfg.isobaric_chunk, stats),
             )
     finally:
         for d in dss:

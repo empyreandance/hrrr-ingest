@@ -50,14 +50,19 @@ def test_cycle_store_roundtrip_sharded(cfg, store, sample_ds, tmp_path):
     publish.write_forecast_hour_local(sample_ds, cycle, 1, cfg)
     publish.assemble_and_upload_cycle(cycle, [0, 1], cfg, store=store)
 
+    # open_zarr is CF-aware, so it unpacks the int16 -> float within quantization
+    # tolerance (step = (max-min)/65534 ≈ 0.046 for sbcape's 0..3000 range).
     back = xr.open_zarr(f"{tmp_path}/cycles/2026052400/data.zarr", consolidated=True)
     assert back.sizes["forecast_hour"] == 2
     assert back["forecast_hour"].values.tolist() == [0, 1]
-    assert np.allclose(back["sbcape"].isel(forecast_hour=0).values, sample_ds["sbcape"].values)
+    assert np.allclose(back["sbcape"].isel(forecast_hour=0).values,
+                       sample_ds["sbcape"].values, atol=0.1)
 
     import zarr
     arr = zarr.open_group(f"{tmp_path}/cycles/2026052400/data.zarr")["sbcape"]
-    assert arr.shards is not None  # sharded (one object for the whole 2D field)
+    assert arr.dtype == np.int16                 # packed to scaled int16
+    assert "scale_factor" in arr.attrs and "add_offset" in arr.attrs
+    assert arr.shards is not None                # sharded (one object for the 2D field)
     meta = str(arr.metadata).lower()
     assert "sharding" in meta and "blosc" in meta
 
