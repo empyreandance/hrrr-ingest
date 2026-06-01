@@ -122,9 +122,15 @@ def write_forecast_hour_local(
     (assemble_and_upload_cycle), so per-forecast-hour writes never hit R2."""
     path = forecast_hour_scratch(cfg, cycle, forecast_hour)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Compress scratch with fast zstd (clevel 1): keeps local scratch ~60GB not
+    # ~500GB for a 48h cycle. It's transient (reassembled into the sharded store
+    # at clevel 5), so favor speed over ratio here.
+    from zarr.codecs import BloscCodec, BloscShuffle
+    comp = BloscCodec(cname="zstd", clevel=1, shuffle=BloscShuffle.shuffle)
+    enc = {v: {"compressors": (comp,)} for v in ds.data_vars}
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-        ds.to_zarr(str(path), mode="w", consolidated=False, zarr_format=3)
+        ds.to_zarr(str(path), mode="w", consolidated=False, zarr_format=3, encoding=enc)
     logger.info("wrote forecast hour (local scratch)", extra={
         "cycle": cycle.cycle_id, "fh": forecast_hour, "n_vars": len(ds.data_vars),
     })
