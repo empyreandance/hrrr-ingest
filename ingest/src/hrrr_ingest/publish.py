@@ -227,18 +227,24 @@ def assemble_and_upload_cycle(
         chunk_spec = {d: (cfg.isobaric_chunk if d == "isobaricInhPa" else -1)
                       for d in combined.dims}
         combined = combined.chunk(chunk_spec)
-        # Per-variable global min/max (one fused Dask pass) -> scaled-int16 packing.
+        # Bound peak RAM. The whole-forecast-hour shards make each Dask chunk
+        # multi-GB (a 48h 3D field is ~3.7GB/chunk); the default threaded
+        # scheduler runs many at once and OOM-killed 48h cycles mid-assemble
+        # (stranding scratch + never publishing the extended forecast). Single-
+        # threaded keeps peak at ~one shard, and the assemble is upload-bound
+        # anyway so the throughput cost is negligible.
         import dask
-        lo_ds, hi_ds = dask.compute(combined.min(skipna=True), combined.max(skipna=True))
-        stats = {v: (float(lo_ds[v].values), float(hi_ds[v].values))
-                 for v in combined.data_vars}
-        local = Path(cfg.work_dir) / cycle.cycle_id / "combined.zarr"
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
-            combined.to_zarr(
-                str(local), mode="w", zarr_format=3, consolidated=True,
-                encoding=_sharded_encoding(combined, n_fh, cfg.isobaric_chunk, stats),
-            )
+        with dask.config.set(scheduler="single-threaded"):
+            lo_ds, hi_ds = dask.compute(combined.min(skipna=True), combined.max(skipna=True))
+            stats = {v: (float(lo_ds[v].values), float(hi_ds[v].values))
+                     for v in combined.data_vars}
+            local = Path(cfg.work_dir) / cycle.cycle_id / "combined.zarr"
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*[Cc]onsolidated metadata.*")
+                combined.to_zarr(
+                    str(local), mode="w", zarr_format=3, consolidated=True,
+                    encoding=_sharded_encoding(combined, n_fh, cfg.isobaric_chunk, stats),
+                )
     finally:
         for d in dss:
             d.close()

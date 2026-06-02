@@ -126,6 +126,16 @@ def run_cycle(
         "dry_run": dry_run,
     })
 
+    # Sweep stranded scratch from any earlier run that was killed before its
+    # cleanup could run (e.g. OOM/SIGKILL) — bounds WORK_DIR to the live cycle.
+    # launchd serializes cycles, so anything that isn't this cycle is dead.
+    if not dry_run:
+        work_root = Path(cfg.work_dir)
+        if work_root.exists():
+            for d in work_root.iterdir():
+                if d.is_dir() and d.name != cycle.cycle_id:
+                    shutil.rmtree(d, ignore_errors=True)
+
     # Wrap the whole cycle so this run's scratch dir is always removed (success
     # OR failure) — raw/subset GRIB must never accumulate in WORK_DIR.
     try:
