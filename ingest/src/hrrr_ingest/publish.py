@@ -42,6 +42,13 @@ MANIFEST_KEY = "manifest.json"
 # cycle locally, then uploading one sharded store. See assemble_and_upload_cycle.
 SCHEMA_VERSION = "2.0"
 
+# Dask workers for the cycle assemble (concat + min/max + sharded write). Each
+# in-flight task can hold a multi-GB shard, so this caps assemble RAM at roughly
+# this many shards. 4 ≈ ~15GB peak on a 48h cycle — safe on 128GB, ~4x faster
+# than single-threaded. The OOM that stranded scratch came from the unbounded
+# default scheduler running ~one task per core.
+ASSEMBLE_WORKERS = 4
+
 
 @dataclass(frozen=True)
 class Store:
@@ -228,13 +235,13 @@ def assemble_and_upload_cycle(
                       for d in combined.dims}
         combined = combined.chunk(chunk_spec)
         # Bound peak RAM. The whole-forecast-hour shards make each Dask chunk
-        # multi-GB (a 48h 3D field is ~3.7GB/chunk); the default threaded
-        # scheduler runs many at once and OOM-killed 48h cycles mid-assemble
-        # (stranding scratch + never publishing the extended forecast). Single-
-        # threaded keeps peak at ~one shard, and the assemble is upload-bound
-        # anyway so the throughput cost is negligible.
+        # multi-GB (a 48h 3D field is ~3.7GB/chunk); the DEFAULT scheduler runs
+        # ~one-per-core at once (~20 × 3.7GB) and OOM-killed 48h cycles mid-
+        # assemble (stranding scratch + never publishing the extended forecast).
+        # Cap at ASSEMBLE_WORKERS so peak ≈ that many shards (~15GB at 4) —
+        # trivial on 128GB — while still parallelizing the read/recompress/write.
         import dask
-        with dask.config.set(scheduler="single-threaded"):
+        with dask.config.set(scheduler="threads", num_workers=ASSEMBLE_WORKERS):
             lo_ds, hi_ds = dask.compute(combined.min(skipna=True), combined.max(skipna=True))
             stats = {v: (float(lo_ds[v].values), float(hi_ds[v].values))
                      for v in combined.data_vars}
